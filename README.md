@@ -6,6 +6,8 @@ You link your phone once, the way you'd link WhatsApp Web, and from then on any 
 
 Built by [@finereli](https://x.com/finereli). Questions and bug reports go in an issue here, or to me on X.
 
+> **This fork** ([mateuscmarim/whatsapp-mcp](https://github.com/mateuscmarim/whatsapp-mcp)) adds: fetching photos, voice notes, videos, documents and stickers (`get_media`), a list of direct chats waiting on a reply (`unanswered_chats`), a Docker setup for running it on your own server instead of Cloudflare ("Run it with Docker"), and a fix that lets pairing finish there.
+
 There are two ways to use it:
 
 - **Use it at [whatsapp.finereli.com](https://whatsapp.finereli.com).** This is the quick way. Sign in with Google, scan the QR code with your phone, and add `https://whatsapp.finereli.com/mcp` to your agent. It's a free beta with a limited number of seats and a size limit per account. Your messages are encrypted at rest, but I run the login service, so in principle I could derive your key. "What it guarantees" below says exactly what that means. If you'd rather not trust me, run your own copy.
@@ -89,6 +91,24 @@ Wrangler prints your URL, something like `https://whatsapp-mcp.your-name.workers
 
 The first sign-in with `OWNER_PASSWORD` creates your account. After that your account's own password is what counts, so changing the secret later does nothing. If you want your own domain, see the comments at the bottom of `wrangler.jsonc`.
 
+### Run it with Docker
+
+The same Worker runs on your own machine under workerd, Cloudflare's open source runtime, through `wrangler dev`. Durable Objects and KV become SQLite files in `./data`, and there is no CPU limit, so a big first import isn't a problem. You need Docker and a way to reach it over https: a Cloudflare Tunnel, Caddy, Traefik, anything that terminates TLS.
+
+```sh
+git clone https://github.com/mateuscmarim/whatsapp-mcp
+cd whatsapp-mcp
+cp .env.example .env    # set PUBLIC_HOST and OWNER_PASSWORD
+docker compose up -d --build
+```
+
+Point your tunnel or proxy at the published port (`127.0.0.1:8787` by default; `BIND` and `PORT` in `.env` change it) for `PUBLIC_HOST`, then carry on from step 1 above with `https://PUBLIC_HOST`. The Worker builds every URL it hands out, OAuth ones included, from `PUBLIC_HOST`, so it has to be the name clients use.
+
+Things that differ from Cloudflare:
+- `./data` is everything: messages, the WhatsApp session, agents' tokens. Back it up together with `.env`; without the password the backup can't be read, and without the backup there is nothing to read.
+- `wrangler dev` is a development server. It holds up fine for one person, but there is no fleet behind it: if the machine is down, so is your agent's WhatsApp.
+- Set `PIN` in `.env` to use `/debug` (`curl -H "x-pin: $PIN" http://127.0.0.1:8787/debug`), which shows the pairing log when a link fails.
+
 ### The Workers Paid note
 
 Importing a large history decodes a lot of data in one go, and the default CPU limit on Workers is too small for it. `wrangler.jsonc` raises it, and raising it needs the paid plan, which is $5 a month. I haven't tried the free plan. If you're on it, remove the `limits` block and expect the first import to be fragile.
@@ -109,7 +129,7 @@ The first version stored messages in plain text. The first sign-in after you dep
 
 **Some chats show up as phone numbers.** WhatsApp doesn't give a linked device every contact name, and most of these are one-off messages from people you never saved. For the ones that matter, your agent can fix it: it lists the unnamed chats, looks the numbers up in your contacts with whatever contacts tool it already has (a Google Contacts or Gmail connector, for example), and saves the names. The server never connects to a contacts service itself. See "Naming chats" below.
 
-**Media isn't downloaded.** Photos, voice notes and documents appear as labels like `[image]` or `[voice note 12s]`, with the caption if there was one. Nothing is transcribed.
+**Media is fetched on request, not stored.** Photos, voice notes, videos, documents and stickers appear as labels like `[image]` or `[voice note 12s]`, with the caption and a media id. The server keeps only what it takes to download the file later (where it is on WhatsApp's servers and its key, sealed like everything else), and `get_media` fetches and decrypts it when your agent asks. Nothing downloaded is kept. WhatsApp's servers drop files after a few weeks; for older ones the phone is asked to upload the file again, which works only while the phone is online and still has it. Messages stored before this was added have no download key; relinking re-imports them with one. Nothing is transcribed.
 
 **Reactions show up as replies.** A 🙏 on a message appears in the chat at the time it was sent, as `[reacted 🙏 to "the message"]`, from whoever sent it. Changing a reaction replaces it, and taking it back removes it. Reactions from before this was added were never stored, so they only appear for older messages if you relink and re-import.
 
@@ -157,6 +177,8 @@ The risk to weigh: every linked device connects from Cloudflare's datacenter add
 | `list_chats` | Chats, most recent first. Filter by name or number. |
 | `get_messages` | Read one chat. Page back or forward by date. |
 | `search_messages` | Search across everything, or within one chat. Takes a list of queries and answers them in one pass. |
+| `unanswered_chats` | Direct chats (not groups) where the other person wrote last and you haven't replied, with how many messages are waiting and since when. Your reaction counts as a reply. |
+| `get_media` | The file behind a photo, sticker, voice note, video or document: images as images, audio as audio, text files as text, anything else as an embedded file. Up to 16 MB. |
 | `unnamed_chats` | Chats known only by phone number, busiest first, with the last thing the other person said. |
 | `set_contact_names` | Save names for phone numbers, in any format. Names stick to the number, so they also show up in groups. |
 | `sync_now` | Pull new messages right now. |
@@ -220,12 +242,14 @@ Don't log a key, put one in a URL, or store one anywhere that outlives a session
 | `src/brand.ts` | The logo as the Worker serves it: the SVG, the PNG icons and the social card, embedded so a deployment needs no static hosting. |
 | `src/phone.ts` | Phone numbers in any format to WhatsApp jids. |
 | `src/whatsapp-do.ts` | The Durable Object. Holds the account record, unlocks with a key, runs Baileys sessions, exposes RPC methods for the Worker. |
+| `src/media.ts` | Downloading and decrypting a message's media from WhatsApp's CDN. |
 | `src/store.ts` | Schema, ingesting Baileys events into SQLite, every query, the search scan, and the migration from the plaintext version. |
 | `src/auth-state.ts` | Baileys auth state backed by the DO's SQLite and sealed (replaces `useMultiFileAuthState`). |
 | `src/mcp.ts` | The MCP tools, and the hint that points agents at the naming tools. |
 | `src/pages.ts`, `src/landing.ts`, `src/privacy.ts`, `src/tos.ts`, `src/ui.ts` | All HTML. `ui.ts` has the shared design tokens. |
 | `src/ws-shim.ts`, `src/lru-shim.ts`, `src/polyfills.ts` | Make Baileys run on workerd. See below. |
 | `scripts/vendor-bridge.mjs` | Extracts the wasm from Baileys' Rust bridge. Runs on `npm install`. |
+| `Dockerfile`, `compose.yml`, `docker/entrypoint.sh` | Running it under `wrangler dev` on your own machine. |
 | `local-export/` | A separate one-off script that dumps your history to JSON files with no server. Not part of the deployment. |
 
 ## How sessions work
