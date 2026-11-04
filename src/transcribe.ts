@@ -5,14 +5,20 @@
 
 const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/interactions';
 const API_REVISION = '2026-05-20';
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash-lite';
+/**
+ * The lite alias follows Google's current Flash-Lite. Tried against a pure tone, the lite models answered
+ * [no speech] while the larger Flash models invented whole sentences, so bigger is not better here.
+ */
+export const DEFAULT_GEMINI_MODEL = 'gemini-flash-lite-latest';
 /** Inline requests are capped at 20 MB in all; base64 grows the audio by a third. */
 export const MAX_AUDIO_BYTES = 14 * 1024 * 1024;
 
+/** Goes after the audio: asked first, the models were more willing to make up speech that wasn't there. */
 const PROMPT =
-  'Transcribe this WhatsApp voice message word for word, in the language it is spoken in. ' +
-  'Reply with the transcript only: no preamble, no timestamps, no speaker labels, no translation. ' +
-  'If there is no speech, reply exactly: [no speech]';
+  'You are a careful speech-to-text system. Transcribe only words that are actually spoken in the WhatsApp voice message above, ' +
+  'word for word, in the language spoken. Never guess or invent words. ' +
+  'If the audio has no intelligible human speech (silence, a tone, music, noise), reply exactly [no speech]. ' +
+  'Reply with the transcript only: no preamble, no timestamps, no speaker labels, no translation.';
 
 /** Gemini accepts the container type, not codec parameters ("audio/ogg; codecs=opus" -> "audio/ogg"). */
 const baseMime = (mime: string) => mime.split(';')[0].trim().toLowerCase() || 'audio/ogg';
@@ -25,8 +31,8 @@ export async function transcribe(audio: { data: string; mime: string }, opts: { 
       model: opts.model || DEFAULT_GEMINI_MODEL,
       store: false, // don't keep the conversation on Google's side
       input: [
-        { type: 'text', text: PROMPT },
         { type: 'audio', data: audio.data, mime_type: baseMime(audio.mime) },
+        { type: 'text', text: PROMPT },
       ],
     }),
   });

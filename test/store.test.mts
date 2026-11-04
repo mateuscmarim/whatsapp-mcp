@@ -246,7 +246,7 @@ check('later lid messages land on the number', (store.getMessages({ chat: LIDPN,
   globalThis.fetch = (async (_u: string, init: any) => { sent = JSON.parse(init.body); headers = init.headers; return Response.json({ steps: [{ type: 'model_output', content: [{ type: 'text', text: 'tudo certo' }] }] }); }) as any;
   const said = await transcribe({ data: 'QUJD', mime: 'audio/ogg; codecs=opus' }, { apiKey: 'k' });
   check('transcribes', said === 'tudo certo', said);
-  check('sends the audio inline with a plain mime type', sent.input[1].type === 'audio' && sent.input[1].data === 'QUJD' && sent.input[1].mime_type === 'audio/ogg', sent?.input?.[1]);
+  check('sends the audio inline with a plain mime type', sent.input[0].type === 'audio' && sent.input[0].data === 'QUJD' && sent.input[0].mime_type === 'audio/ogg' && sent.input[1].type === 'text', sent?.input);
   check('asks Google not to store it', sent.store === false && headers['x-goog-api-key'] === 'k');
   globalThis.fetch = (async () => Response.json({ error: { message: 'API key not valid' } }, { status: 400 })) as any;
   let err = '';

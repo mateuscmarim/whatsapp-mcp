@@ -39,7 +39,7 @@ export interface Env extends AuthEnv {
   DEFAULT_COUNTRY_CODE?: string;
   /** Secret. Turns on transcribe_audio, which sends voice notes to Google's Gemini API. Optional. */
   GEMINI_API_KEY?: string;
-  /** Gemini model for transcription. Optional; see DEFAULT_GEMINI_MODEL. */
+  /** Gemini model for transcription. Optional; see DEFAULT_GEMINI_MODEL in transcribe.ts. */
   GEMINI_MODEL?: string;
 }
 
