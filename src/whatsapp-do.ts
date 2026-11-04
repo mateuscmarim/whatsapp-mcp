@@ -20,6 +20,7 @@ import { sqliteAuthState } from './auth-state.js';
 import { Store, initSchema, isLegacy, migrateLegacy } from './store.js';
 import type { MediaKind, MediaRef } from './store.js';
 import { downloadMedia } from './media.js';
+import { MAX_AUDIO_BYTES, transcribe } from './transcribe.js';
 import { Vault } from './vault.js';
 import { limitsOf, verdict } from './limits.js';
 import { contactText, xHandle } from './ui.js';
@@ -338,6 +339,34 @@ export class WhatsAppStore extends DurableObject<Env> {
       ok: true, kind: ref.k, mime: ref.mime ?? 'application/octet-stream', ...(ref.name ? { name: ref.name } : {}),
       data: Buffer.from(got.bytes).toString('base64'), size: got.bytes.length, reuploaded,
     };
+  }
+
+  /**
+   * Transcribe voice notes and audio with Gemini, keeping each transcript with its message so it is paid for
+   * once and found by search afterwards. One result per id, in order.
+   */
+  async transcribeAudio(chat: string, ids: string[]): Promise<{ id: string; ok: boolean; text: string; cached?: boolean }[]> {
+    const apiKey = this.env.GEMINI_API_KEY;
+    if (!apiKey) return ids.map((id) => ({ id, ok: false, text: 'transcription is not set up on this server (GEMINI_API_KEY)' }));
+    const out: { id: string; ok: boolean; text: string; cached?: boolean }[] = [];
+    for (const id of ids) {
+      const saved = this.store.transcript(chat, id);
+      if (saved) { out.push({ id, ok: true, text: saved, cached: true }); continue; }
+      const ref = this.store.media(chat, id);
+      if (ref && ref.k !== 'audio') { out.push({ id, ok: false, text: `that is ${ref.k === 'image' ? 'an' : 'a'} ${ref.k}, not audio` }); continue; }
+      if (ref?.len && ref.len > MAX_AUDIO_BYTES) { out.push({ id, ok: false, text: 'too long to transcribe in one request' }); continue; }
+      const media = await this.fetchMedia(chat, id);
+      if (!media.ok) { out.push({ id, ok: false, text: media.error }); continue; }
+      try {
+        const text = await transcribe({ data: media.data, mime: media.mime }, { apiKey, model: this.env.GEMINI_MODEL });
+        this.store.setTranscript(chat, id, text);
+        out.push({ id, ok: true, text });
+      } catch (e: any) {
+        this.note(`transcribe: ${e?.message}`.slice(0, 300));
+        out.push({ id, ok: false, text: e?.message ?? 'transcription failed' });
+      }
+    }
+    return out;
   }
 
   /** Ask the phone to put an expired file back on the CDN, over a socket held open for the purpose. */

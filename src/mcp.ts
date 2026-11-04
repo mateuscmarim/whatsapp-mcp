@@ -47,7 +47,8 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         `Access to the user's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
         `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
         `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, unanswered_chats for direct messages still waiting on a reply. ` +
-        `Photos, voice notes, videos, documents and stickers show as labels with a media id; get_media fetches the file itself. ${NAME_HINT}`,
+        `Photos, voice notes, videos, documents and stickers show as labels with a media id; get_media fetches the file itself` +
+        `${env.GEMINI_API_KEY ? ' and transcribe_audio turns voice notes into text' : ''}. ${NAME_HINT}`,
     },
   );
 
@@ -197,6 +198,30 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       return { content: [{ type: 'text' as const, text: about }, { type: 'resource' as const, resource: { uri, mimeType: mime, blob: r.data } }] };
     },
   );
+
+  if (env.GEMINI_API_KEY) {
+    server.registerTool(
+      'transcribe_audio',
+      {
+        description:
+          'Transcribe voice notes or audio messages in one chat to text. Take `chat` (jid) and the ids from the "(media id: ...)" next to [voice note] or [audio] ' +
+          'in get_messages or search_messages; batch every voice note you need from a chat in one call. A transcript is saved with its message, so asking again is free ' +
+          'and search_messages finds words in it afterwards. The audio is sent to Google (Gemini) to be transcribed.',
+        inputSchema: {
+          chat: z.string().describe('Chat jid, as shown next to the message'),
+          message_ids: z.array(z.string()).min(1).max(20).describe('Media ids of the voice notes, in the order you want them'),
+        },
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      },
+      async ({ chat, message_ids }) => {
+        const matches = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
+        if (!matches.length) return text(`No chat matches "${chat}". Pass the jid shown next to the message.`);
+        if (matches.length > 1 && !chat.includes('@')) return text(`"${chat}" matches several chats, pass the jid:\n` + matches.map((m) => `${m.name} | ${m.jid}`).join('\n'));
+        const rows = await wa.transcribeAudio(matches[0].jid, message_ids);
+        return text(rows.map((r) => (r.ok ? `${r.id}: ${r.text}` : `${r.id}: could not transcribe (${r.text})`)).join('\n\n'));
+      },
+    );
+  }
 
   server.registerTool(
     'unnamed_chats',

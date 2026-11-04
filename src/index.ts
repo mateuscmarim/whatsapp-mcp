@@ -37,6 +37,10 @@ export interface Env extends AuthEnv {
   OPERATOR_NAME?: string;
   /** Country code (digits, no +) for phone numbers given without one, e.g. "972". */
   DEFAULT_COUNTRY_CODE?: string;
+  /** Secret. Turns on transcribe_audio, which sends voice notes to Google's Gemini API. Optional. */
+  GEMINI_API_KEY?: string;
+  /** Gemini model for transcription. Optional; see DEFAULT_GEMINI_MODEL. */
+  GEMINI_MODEL?: string;
 }
 
 /** What an agent's token carries: who, and the key that opens their data. Encrypted by the OAuth library under the token. */

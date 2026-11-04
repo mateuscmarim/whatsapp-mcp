@@ -218,6 +218,43 @@ check('later lid messages land on the number', (store.getMessages({ chat: LIDPN,
   globalThis.fetch = realFetch;
 }
 
+// ---------- transcripts ----------
+{
+  const { sql: tsql } = makeSql();
+  initSchema(tsql);
+  const ts = new Store(tsql, (fn) => fn(), vault);
+  const BIA = '5511988887777@s.whatsapp.net';
+  ts.ingestMessages([{ key: { id: 'v1', remoteJid: BIA, fromMe: false }, messageTimestamp: 100, message: { audioMessage: { ptt: true, seconds: 12, mimetype: 'audio/ogg; codecs=opus', mediaKey: new Uint8Array(32), directPath: '/v/a' } } } as any]);
+  check('a voice note keeps its media', ts.media(BIA, 'v1')?.k === 'audio');
+  check('no transcript yet', ts.transcript(BIA, 'v1') === null);
+  ts.setTranscript(BIA, 'v1', 'chego em dez minutos');
+  check('the transcript is saved', ts.transcript(BIA, 'v1') === 'chego em dez minutos');
+  check('and shows after the label when reading', (ts.getMessages({ chat: BIA, limit: 5 }) as any[])[0].body === '[voice note 12s] (transcript) chego em dez minutos');
+  check('and search finds it', ts.search({ queries: ['dez minutos'], limit: 5 }).hits[0].length === 1);
+  ts.setTranscript(BIA, 'v1', 'chego em cinco minutos');
+  check('a new transcript replaces the old one', (ts.getMessages({ chat: BIA, limit: 5 }) as any[])[0].body === '[voice note 12s] (transcript) chego em cinco minutos');
+
+  const { transcribe, outputText } = await import('../src/transcribe.ts');
+  check('reads output_text', outputText({ output_text: ' oi ' }) === 'oi');
+  check('reads the text of model steps, skipping input and thoughts', outputText({ steps: [
+    { type: 'user_input', content: [{ type: 'text', text: 'PROMPT' }] },
+    { type: 'thought', content: [{ type: 'text', text: 'hmm' }] },
+    { type: 'model_output', content: [{ type: 'text', text: 'bom ' }, { type: 'text', text: 'dia' }] },
+  ] }) === 'bom dia');
+  const realFetch = globalThis.fetch;
+  let sent: any = null, headers: any = null;
+  globalThis.fetch = (async (_u: string, init: any) => { sent = JSON.parse(init.body); headers = init.headers; return Response.json({ steps: [{ type: 'model_output', content: [{ type: 'text', text: 'tudo certo' }] }] }); }) as any;
+  const said = await transcribe({ data: 'QUJD', mime: 'audio/ogg; codecs=opus' }, { apiKey: 'k' });
+  check('transcribes', said === 'tudo certo', said);
+  check('sends the audio inline with a plain mime type', sent.input[1].type === 'audio' && sent.input[1].data === 'QUJD' && sent.input[1].mime_type === 'audio/ogg', sent?.input?.[1]);
+  check('asks Google not to store it', sent.store === false && headers['x-goog-api-key'] === 'k');
+  globalThis.fetch = (async () => Response.json({ error: { message: 'API key not valid' } }, { status: 400 })) as any;
+  let err = '';
+  try { await transcribe({ data: 'QUJD', mime: 'audio/ogg' }, { apiKey: 'bad' }); } catch (e: any) { err = e.message; }
+  check('surfaces Gemini errors', err.includes('API key not valid'), err);
+  globalThis.fetch = realFetch;
+}
+
 // ---------- unanswered ----------
 {
   const { sql: usql } = makeSql();

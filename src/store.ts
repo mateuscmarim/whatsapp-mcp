@@ -14,7 +14,7 @@ import type { Vault } from './vault.js';
 // What each kind of blob is bound to, so one can't be swapped for another.
 const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l';
 
-interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef }          // body, push name, sender jid, media
+interface MsgBlob { b: string; p?: string; s?: string; m?: MediaRef; t?: string } // body, push name, sender jid, media, transcript
 interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
 interface ContactRec { jid: string; name?: string | null; notify?: string | null }
 
@@ -656,6 +656,24 @@ export class Store {
   media(chat: string, id: string): MediaRef | null {
     const r = this.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM messages WHERE chat = ? AND id = ?`, this.pj(chat), id).toArray()[0];
     return r ? (this.vault.open<MsgBlob>(r.data, MSG).m ?? null) : null;
+  }
+
+  /** A voice note's saved transcript, if it has been transcribed. */
+  transcript(chat: string, id: string): string | null {
+    const r = this.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM messages WHERE chat = ? AND id = ?`, this.pj(chat), id).toArray()[0];
+    return r ? (this.vault.open<MsgBlob>(r.data, MSG).t ?? null) : null;
+  }
+
+  /** Keep a transcript with the message and in its text, after the label, so reading and search see it. */
+  setTranscript(chat: string, id: string, transcript: string) {
+    const cid = this.pj(chat);
+    const r = this.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM messages WHERE chat = ? AND id = ?`, cid, id).toArray()[0];
+    if (!r) return;
+    const blob = this.vault.open<MsgBlob>(r.data, MSG);
+    const label = blob.t ? blob.b.slice(0, blob.b.length - ` (transcript) ${blob.t}`.length) : blob.b;
+    blob.t = transcript;
+    blob.b = `${label} (transcript) ${transcript}`;
+    this.sql.exec(`UPDATE messages SET data = ? WHERE chat = ? AND id = ?`, this.vault.seal(blob, MSG), cid, id);
   }
 
   /** Where the phone re-uploaded a message's media to. */
