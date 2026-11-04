@@ -6,7 +6,6 @@ services:
     env_file: .env
     environment:
       PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST in .env}
-      OWNER_PASSWORD: ${OWNER_PASSWORD:?set OWNER_PASSWORD in .env}
     ports:
       - "${BIND:-127.0.0.1}:${PORT:-8787}:8787"
     volumes:
