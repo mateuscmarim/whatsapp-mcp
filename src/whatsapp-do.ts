@@ -18,6 +18,8 @@ import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
 import { sqliteAuthState } from './auth-state.js';
 import { Store, initSchema, isLegacy, migrateLegacy } from './store.js';
+import type { MediaKind, MediaRef } from './store.js';
+import { downloadMedia } from './media.js';
 import { Vault } from './vault.js';
 import { limitsOf, verdict } from './limits.js';
 import { contactText, xHandle } from './ui.js';
@@ -30,6 +32,8 @@ export interface SessionResult { reason: string; added: number; ms: number }
 const PAIR_MAX_MS = 10 * 60_000;
 const PAIR_ABANDON_MS = 3 * 60_000;
 const PULL_MAX_MS = 60_000;
+const REUPLOAD_WAIT_MS = 30_000;
+const MEDIA_MAX_BYTES = 16 * 1024 * 1024;
 
 const show = (x: unknown): string =>
   x instanceof Error ? `${x.name}: ${x.message}` : typeof x === 'string' ? x : JSON.stringify(x, (_k, v) => (v instanceof Error ? `${v.name}: ${v.message}` : v));
@@ -301,11 +305,78 @@ export class WhatsAppStore extends DurableObject<Env> {
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }
   unnamedChats(limit: number) { return this.store.unnamedChats(limit); }
+  unanswered(o: Parameters<Store['unanswered']>[0]) { return this.store.unanswered(o); }
   setNames(rows: { jid: string; name: string }[]) { return this.store.setCustomNames(rows); }
+
+  // ---------- media ----------
+
+  /**
+   * Download one message's media. WhatsApp's CDN keeps a file for a few weeks; after that the phone is asked to
+   * upload it again, which needs the phone online and still holding the file. The bytes are returned, never stored.
+   */
+  async fetchMedia(chat: string, id: string): Promise<
+    { ok: true; kind: MediaKind; mime: string; name?: string; data: string; size: number; reuploaded: boolean } | { ok: false; error: string }
+  > {
+    const ref = this.store.media(chat, id);
+    if (!ref) return { ok: false, error: 'That message has no media stored. Media from before this server kept download keys can only come back by relinking (stored messages are kept).' };
+    let got = await downloadMedia(ref, MEDIA_MAX_BYTES);
+    let reuploaded = false;
+    if (!got.ok && got.expired) {
+      const why = got.error;
+      try {
+        const loc = await this.reupload(id, ref);
+        this.store.setMediaLocation(chat, id, loc);
+        got = await downloadMedia({ ...ref, ...loc }, MEDIA_MAX_BYTES);
+        reuploaded = true;
+      } catch (e: any) {
+        this.note(`media re-upload: ${e?.message}`);
+        return { ok: false, error: `${why}, and asking the phone to upload it again failed (${e?.message}). The phone has to be online and still have the file.` };
+      }
+    }
+    if (!got.ok) return { ok: false, error: got.error };
+    return {
+      ok: true, kind: ref.k, mime: ref.mime ?? 'application/octet-stream', ...(ref.name ? { name: ref.name } : {}),
+      data: Buffer.from(got.bytes).toString('base64'), size: got.bytes.length, reuploaded,
+    };
+  }
+
+  /** Ask the phone to put an expired file back on the CDN, over a socket held open for the purpose. */
+  private async reupload(id: string, ref: MediaRef): Promise<{ path?: string; url?: string }> {
+    const field = `${ref.k}Message`;
+    const content: Record<string, unknown> = { mediaKey: Buffer.from(ref.key, 'base64'), directPath: ref.path, url: ref.url, mimetype: ref.mime };
+    const message = { key: { ...ref.rk, id }, message: { [field]: content } };
+    return this.withSocket(async (sock) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('the phone did not answer')), REUPLOAD_WAIT_MS); });
+      try {
+        const updated: any = await Promise.race([sock.updateMediaMessage(message as any), timeout]);
+        const c = updated?.message?.[field] ?? content;
+        return { path: c.directPath ?? undefined, url: c.url ?? undefined };
+      } finally {
+        clearTimeout(timer);
+      }
+    });
+  }
+
+  /** Run fn on an open socket, starting a pull session if none is running and keeping it from ending meanwhile. */
+  private async withSocket<T>(fn: (sock: WASocket) => Promise<T>): Promise<T> {
+    if (!this.auth.isPaired()) throw new Error('WhatsApp is not linked');
+    this.holds++;
+    try {
+      if (!this.session) void this.pull().catch(() => {});
+      for (let i = 0; i < 80 && !(this.sock && this.phase === 'syncing'); i++) await new Promise((r) => setTimeout(r, 250));
+      if (!this.sock || this.phase !== 'syncing') throw new Error('could not connect to WhatsApp');
+      return await fn(this.sock);
+    } finally {
+      this.holds--;
+    }
+  }
 
   // ---------- the session ----------
 
   private sock: WASocket | null = null;
+  /** Callers that need the socket to stay open (media re-upload); a session doesn't end for being idle while any wait. */
+  private holds = 0;
 
   private runSession(opts: { pairing: boolean; maxMs: number; idleMs: number }): Promise<SessionResult> {
     const started = Date.now();
@@ -433,6 +504,7 @@ export class WhatsAppStore extends DurableObject<Env> {
         const paired = this.auth.isPaired();
         if (opts.pairing && !paired && now - this.lastPoll > PAIR_ABANDON_MS) return void finish('abandoned');
         if (!paired) return; // waiting on a scan
+        if (this.holds) return;
         // a first link waits for WhatsApp's own "100%"; a plain pull just waits for quiet
         const historyDone = !opts.pairing || this.historyProgress === 100;
         if (backlogDelivered && historyDone && now - lastActivity > opts.idleMs) void finish('idle');

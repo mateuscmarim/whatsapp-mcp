@@ -31,6 +31,10 @@ const NAME_HINT =
 
 type Rows = Record<string, any>[];
 
+/** Media messages carry their id, which get_media takes. */
+const mediaTag = (r: Record<string, any>) => (r.media ? ` (media id: ${r.id})` : '');
+const TEXTUAL = /^(text\/|application\/(json|xml|csv)\b)/;
+
 const displayNumber = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
 
 function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
@@ -42,7 +46,8 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       instructions:
         `Access to the user's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
         `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
-        `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats. ${NAME_HINT}`,
+        `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats, unanswered_chats for direct messages still waiting on a reply. ` +
+        `Photos, voice notes, videos, documents and stickers show as labels with a media id; get_media fetches the file itself. ${NAME_HINT}`,
     },
   );
 
@@ -97,7 +102,7 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       }
       const rows = (await wa.getMessages({ chat: matches[0].jid, limit, before: epoch(before), after: epoch(after) })) as Rows;
       const head = `# ${matches[0].name} (${rows.length} messages)\n`;
-      return text(note + head + rows.map((r) => `[${when(r.ts)}] ${r.sender}: ${r.body}`).join('\n'));
+      return text(note + head + rows.map((r) => `[${when(r.ts)}] ${r.sender}: ${r.body}${mediaTag(r)}`).join('\n'));
     },
   );
 
@@ -129,10 +134,67 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         chatJid = m[0].jid;
       }
       const { hits } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
-      const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}`).join('\n');
+      const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}${mediaTag(r)} | ${r.chat}`).join('\n');
       const none = `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`;
       if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) : none));
       return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
+    },
+  );
+
+  server.registerTool(
+    'unanswered_chats',
+    {
+      description:
+        'Direct (one-to-one) chats where the other person wrote last and the user has not replied yet, most recent first. Groups are left out. ' +
+        'A reaction from the user counts as a reply. Each row says how many messages are waiting, since when, and the last one. ' +
+        'Defaults to chats active in the last 14 days; pass `since` to look further back.',
+      inputSchema: {
+        since: z.string().optional().describe('ISO date; only chats whose last message is at or after this. Default: 14 days ago'),
+        limit: z.number().int().min(1).max(100).default(30),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ since, limit }) => {
+      const note = await fresh();
+      const from = epoch(since) ?? Math.floor(Date.now() / 1000) - 14 * 86400;
+      const rows = (await wa.unanswered({ since: from, limit })) as Rows;
+      if (!rows.length) return text(note + `No direct chats are waiting on a reply since ${when(from)}.`);
+      const lines = rows.map(
+        (r) => `${r.name} | ${r.waiting} waiting since ${when(r.since)} | last ${when(r.last_ts)}: "${oneLine(r.last, 160)}" | ${r.jid}`,
+      );
+      return text(note + `${rows.length} direct chats waiting on a reply:\n${lines.join('\n')}`);
+    },
+  );
+
+  server.registerTool(
+    'get_media',
+    {
+      description:
+        'Fetch the file behind a photo, sticker, voice note, audio, video or document message. Take `chat` (jid) and `message_id` from the ' +
+        '"(media id: ...)" in get_messages or search_messages. Images and stickers come back as images you can look at, audio as audio, ' +
+        'text documents as text, and other files (PDFs, videos) as an embedded file. Files over 16 MB are refused. ' +
+        'Media older than a few weeks has left WhatsApp\'s servers; the phone is then asked to upload it again, which only works while it is online and still has the file.',
+      inputSchema: {
+        chat: z.string().describe('Chat jid, as shown next to the message'),
+        message_id: z.string().describe('The media id shown next to the message'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, message_id }) => {
+      const matches = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
+      if (!matches.length) return text(`No chat matches "${chat}". Pass the jid shown next to the message.`);
+      if (matches.length > 1 && !chat.includes('@')) return text(`"${chat}" matches several chats, pass the jid:\n` + matches.map((m) => `${m.name} | ${m.jid}`).join('\n'));
+      const r = await wa.fetchMedia(matches[0].jid, message_id);
+      if (!r.ok) return { content: [{ type: 'text' as const, text: `Could not get that media: ${r.error}` }], isError: true };
+      const mime = r.mime.split(';')[0].trim();
+      const about = `${r.kind}${r.name ? ` "${r.name}"` : ''}, ${mime}, ${(r.size / 1024).toFixed(0)} KB${r.reuploaded ? ' (re-uploaded by the phone)' : ''}`;
+      if (r.kind === 'image' || r.kind === 'sticker') return { content: [{ type: 'text' as const, text: about }, { type: 'image' as const, data: r.data, mimeType: mime }] };
+      if (r.kind === 'audio') return { content: [{ type: 'text' as const, text: about }, { type: 'audio' as const, data: r.data, mimeType: mime }] };
+      const uri = `whatsapp://media/${encodeURIComponent(matches[0].jid)}/${encodeURIComponent(message_id)}`;
+      if (TEXTUAL.test(mime)) {
+        return { content: [{ type: 'text' as const, text: about }, { type: 'resource' as const, resource: { uri, mimeType: mime, text: Buffer.from(r.data, 'base64').toString('utf8') } }] };
+      }
+      return { content: [{ type: 'text' as const, text: about }, { type: 'resource' as const, resource: { uri, mimeType: mime, blob: r.data } }] };
     },
   );
 

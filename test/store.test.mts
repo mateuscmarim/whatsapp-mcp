@@ -167,6 +167,80 @@ check('later lid messages land on the number', (store.getMessages({ chat: LIDPN,
   check('reactions are searchable', (rs.search({ queries: ['pizza'], limit: 10 }).hits[0]).length === 2);
 }
 
+// ---------- media ----------
+{
+  const { sql: msql } = makeSql();
+  initSchema(msql);
+  const ms = new Store(msql, (fn) => fn(), vault);
+  const ANA = '5511999990000@s.whatsapp.net';
+  const KEY = new Uint8Array(32).fill(7);
+  const IMG = (id: string, ts: number, extra: any = {}) =>
+    ({ key: { id, remoteJid: ANA, fromMe: false }, messageTimestamp: ts, message: { imageMessage: { caption: 'the receipt', mimetype: 'image/jpeg', mediaKey: KEY, directPath: '/v/t62/abc', fileLength: 1234, ...extra } } }) as any;
+
+  ms.ingestMessages([IMG('i1', 100)]);
+  const ref = ms.media(ANA, 'i1');
+  check('an image keeps what it takes to download it', ref?.k === 'image' && ref.path === '/v/t62/abc' && ref.key === Buffer.from(KEY).toString('base64') && ref.mime === 'image/jpeg' && ref.len === 1234, ref);
+  check('and the message key, for asking the phone to re-upload', ref?.rk.remoteJid === ANA && ref.rk.fromMe === false, ref?.rk);
+  check('reading flags it as media', (ms.getMessages({ chat: ANA, limit: 5 }) as any[])[0].media === true);
+  check('text has no media', (ms.ingestMessages([M('t1', ANA, 110, 'thanks')]), ms.media(ANA, 't1')) === null);
+
+  // a message stored before media was kept gets it filled in on a repeat delivery
+  ms.ingestMessages([IMG('i2', 120, { mediaKey: undefined })]);
+  check('no key, no media', ms.media(ANA, 'i2') === null);
+  ms.ingestMessages([IMG('i2', 120)]);
+  check('a repeat delivery fills it in', ms.media(ANA, 'i2')?.path === '/v/t62/abc');
+  ms.setMediaLocation(ANA, 'i2', { path: '/v/new' });
+  check('a re-upload moves it', ms.media(ANA, 'i2')?.path === '/v/new' && ms.media(ANA, 'i2')?.key === Buffer.from(KEY).toString('base64'));
+
+  // WhatsApp's format: HKDF(mediaKey) -> iv, AES-CBC key, HMAC key; file = ciphertext + first 10 bytes of HMAC(iv || ciphertext)
+  const { downloadMedia } = await import('../src/media.ts');
+  const plain = new TextEncoder().encode('a tiny jpeg, honestly');
+  const base = await crypto.subtle.importKey('raw', KEY, 'HKDF', false, ['deriveBits']);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: new TextEncoder().encode('WhatsApp Image Keys') }, base, 112 * 8));
+  const iv = bits.slice(0, 16);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-CBC', iv }, await crypto.subtle.importKey('raw', bits.slice(16, 48), 'AES-CBC', false, ['encrypt']), plain));
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw', bits.slice(48, 80), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']), new Uint8Array([...iv, ...ct]))).slice(0, 10);
+  const file = new Uint8Array([...ct, ...mac]);
+  const realFetch = globalThis.fetch;
+  let asked = '';
+  globalThis.fetch = (async (u: string) => { asked = u; return u.endsWith('/gone') ? new Response('', { status: 410 }) : new Response(file); }) as any;
+  const got = await downloadMedia({ k: 'image', key: ref!.key, path: '/v/t62/abc' }, 1e6);
+  check('downloads from the CDN path', asked === 'https://mmg.whatsapp.net/v/t62/abc', asked);
+  check('and decrypts', got.ok && new TextDecoder().decode(got.bytes) === 'a tiny jpeg, honestly', got);
+  const tampered = file.slice(); tampered[0] ^= 1;
+  globalThis.fetch = (async () => new Response(tampered)) as any;
+  const bad = await downloadMedia({ k: 'image', key: ref!.key, path: '/x' }, 1e6);
+  check('a tampered file fails the integrity check', !bad.ok && !bad.expired);
+  globalThis.fetch = (async () => new Response('', { status: 410 })) as any;
+  const gone = await downloadMedia({ k: 'image', key: ref!.key, path: '/gone' }, 1e6);
+  check('a 410 means expired', !gone.ok && gone.expired);
+  check('too big is refused before downloading', !(await downloadMedia({ k: 'image', key: ref!.key, path: '/x', len: 2e6 }, 1e6)).ok);
+  globalThis.fetch = realFetch;
+}
+
+// ---------- unanswered ----------
+{
+  const { sql: usql } = makeSql();
+  initSchema(usql);
+  const us = new Store(usql, (fn) => fn(), vault);
+  const A = '5511900000001@s.whatsapp.net', B = '5511900000002@s.whatsapp.net', C = '5511900000003@s.whatsapp.net', D = '5511900000004@s.whatsapp.net', G = '1234@g.us';
+  const R = (id: string, chat: string, ts: number, target: string, text: string, fromMe: boolean) =>
+    ({ key: { id, remoteJid: chat, fromMe }, messageTimestamp: ts, message: { reactionMessage: { key: { id: target }, text, senderTimestampMs: ts * 1000 } } }) as any;
+  us.ingestMessages([
+    M('a1', A, 100, 'oi', true), M('a2', A, 200, 'tudo bem?'), M('a3', A, 210, 'me liga'),          // waiting: 2
+    M('b1', B, 100, 'pode ser amanha?'), M('b2', B, 150, 'pode sim', true),                         // answered
+    M('c1', C, 100, 'mandei o arquivo'), R('c2', C, 120, 'c1', '👍', true),                          // my reaction answers
+    M('d1', D, 100, 'valeu', true), R('d2', D, 130, 'd1', '❤️', false),                              // their reaction is not a message
+    M('g1', G, 300, 'alguem?', false, { key: { participant: A } }),                                 // groups are left out
+  ]);
+  const un = us.unanswered({ limit: 10 });
+  check('only direct chats where they spoke last', JSON.stringify(un.map((r) => r.jid)) === JSON.stringify([A]), un);
+  check('counts what is waiting, since the first of it', un[0]?.waiting === 2 && un[0].since === 200 && un[0].last === 'me liga', un[0]);
+  check('since filters by last activity', us.unanswered({ since: 250, limit: 10 }).length === 0);
+  us.ingestMessages([M('a4', A, 220, 'respondi', true)]);
+  check('a reply clears it', us.unanswered({ limit: 10 }).length === 0);
+}
+
 // ---------- search ----------
 
 const ts0 = 1000;
